@@ -1,4 +1,6 @@
-import fitz
+from base64 import encode
+
+import pymupdf
 import tiktoken
 from pydantic import BaseModel
 
@@ -35,5 +37,42 @@ def extract_and_chunk_pdf(
         ValueError: If `max_tokens <= 0`, `overlap_tokens < 0`, or
             `overlap_tokens >= max_tokens`.
     """
+    chunks: list[ChunkData] = []
+    chunk_index = 0
+
+    enc = tiktoken.get_encoding(ENCODING_NAME)
+    step = max_tokens - overlap_tokens
+
     if max_tokens <= 0 or overlap_tokens < 0 or overlap_tokens >= max_tokens:
         raise ValueError("Invalid window input arguments")
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for pg_no, pg in enumerate(doc.pages(), start=1):
+            text = pg.get_text().strip()
+
+            if not text:
+                continue
+
+            tokens = enc.encode(text)
+            if not tokens:
+                continue
+
+            for start in range(0, len(tokens), step):
+                window = tokens[start : start + max_tokens]
+
+                content = enc.decode(window)
+
+                chunks.append(
+                    ChunkData(
+                        chunk_index=chunk_index,
+                        page_number=pg_no,
+                        content=content,
+                        token_count=len(window),
+                    )
+                )
+
+                chunk_index += 1
+
+                if start + max_tokens >= len(tokens):
+                    break
+
+    return chunks
