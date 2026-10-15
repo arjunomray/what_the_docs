@@ -22,7 +22,7 @@ flowchart TD
 
     subgraph Retrieval ["2. Hybrid Retrieval & Cache Pipeline"]
         UserQuery["POST /api/query"] --> Cache{"Redis Query Cache Hit?"}
-        Cache -->|Hit (< 2ms)| ReturnCached["Return Cached Answer + Citations"]
+        Cache -->|"Hit (sub-2ms)"| ReturnCached["Return Cached Answer + Citations"]
         Cache -->|Miss| Search["Hybrid RRF Search (SQL CTE)"]
         Search --> HNSW["HNSW Cosine Vector Search (<=>)"]
         Search --> GIN["GIN Inverted Index (tsvector @@)"]
@@ -40,13 +40,15 @@ flowchart TD
 ### 1. Dual Indexing in PostgreSQL: Semantic (HNSW) + Lexical (GIN)
 * **The Problem with Pure Vector Search**: Dense embeddings capture semantic similarity well ("automobile repair" matches "car maintenance"), but routinely fail on exact keywords, error codes (`ERR_REDIS_CLUSTER_DOWN`), product identifiers, or specialized symbols.
 * **The Architecture**:
-  - **HNSW Index (`vector_cosine_ops`, $M=16, \text{ef\_construction}=64$)**: Builds a multi-layer graph over 1536-dimensional vectors, enabling $O(\log N)$ approximate nearest neighbor cosine search without requiring full table scans. Unlike IVFFlat, HNSW does not require upfront training or periodic rebuilds as rows are inserted.
+  - **HNSW Index (`vector_cosine_ops`, `m=16`, `ef_construction=64`)**: Builds a multi-layer graph over 1536-dimensional vectors, enabling $O(\log N)$ approximate nearest neighbor cosine search without requiring full table scans. Unlike IVFFlat, HNSW does not require upfront training or periodic rebuilds as rows are inserted.
   - **GIN Index on persisted `TSVECTOR`**: Automatically stems English text into lexemes (`to_tsvector('english', content)`). `websearch_to_tsquery` provides sub-millisecond keyword lookup through an inverted index.
 
 ### 2. Reciprocal Rank Fusion (RRF) in a Single SQL CTE
-* **Why Not Linear Score Addition?**: Cosine distance ($0.0$ to $2.0$) and PostgreSQL `ts_rank` ($0.0$ to unbounded) operate on completely incompatible scales. Normalizing and weighting them ($w_1 \cdot \text{cos} + w_2 \cdot \text{bm25}$) is fragile and breaks across different query lengths.
+* **Why Not Linear Score Addition?**: Cosine distance (0.0 to 2.0) and PostgreSQL `ts_rank` (0.0 to unbounded) operate on completely incompatible scales. Normalizing and weighting them (`w1 * cos + w2 * bm25`) is fragile and breaks across different query lengths.
 * **The Solution**: RRF fuses the **order** of results rather than their arbitrary raw scores:
-  $$\text{RRF Score}(d) = \sum_{m \in \{\text{vec}, \text{fts}\}} \frac{1}{k + \text{rank}_m(d)} \quad (k = 60)$$
+  
+  $$\text{RRF}(d) = \frac{1}{60 + \text{rank}_{\text{vec}}(d)} + \frac{1}{60 + \text{rank}_{\text{fts}}(d)}$$
+
   Executed entirely inside PostgreSQL using a Common Table Expression (CTE) with `FULL OUTER JOIN`, avoiding application-layer joins or multiple database roundtrips.
 
 ### 3. Token-Aware Sliding Window Chunker
@@ -59,12 +61,12 @@ flowchart TD
 
 ### 4. Background Ingestion & Idempotent Deduplication
 * **Non-Blocking Uploads**: Parsing PDFs and batch-embedding hundreds of chunks takes 3–10 seconds of I/O. Doing this in the HTTP request loop risks thread starvation and HTTP 504 timeouts.
-* **`arq` Asynchronous Queue**: The HTTP handler computes the PDF's SHA-256 hash. If already ingested, it immediately returns `200 OK`. If new, it creates a `Document(status=PENDING)` record, offloads the task to `arq`, and returns `202 Accepted` in **$< 15\text{ ms}$**.
+* **`arq` Asynchronous Queue**: The HTTP handler computes the PDF's SHA-256 hash. If already ingested, it immediately returns `200 OK`. If new, it creates a `Document(status=PENDING)` record, offloads the task to `arq`, and returns `202 Accepted` in **< 15 ms**.
 * **State Machine**: Transitions through `PENDING` $\to$ `PROCESSING` $\to$ `READY` or `FAILED` (with detailed `error_message` and transaction rollback on failure).
 
 ### 5. Redis Query Caching & Production-Safe Invalidation
 * **Cache Key**: Deterministic SHA-256 digest of normalized input:
-  $$\text{Key} = \text{sha256}(\text{lower}(\text{trim}(\text{query})) : \text{document\_id})$$
+  `Key = sha256(lower(trim(query)) + ":" + document_id)`
 * **Non-Blocking Invalidation**: Calling `FLUSHDB` in production is catastrophic if Redis also hosts the worker queue or session state. Furthermore, `KEYS *` blocks Redis's single-threaded event loop. `QueryCache.invalidate_all()` uses **cursor-based `SCAN` (`scan_iter`)** to safely discover and purge only `rag:query:*` keys whenever documents are created or deleted.
 
 ---
@@ -75,11 +77,11 @@ Under a load test of **50 concurrent Virtual Users (VUs)** using Grafana k6 (`be
 
 | Metric | Cache Miss (Full RAG Pipeline) | Cache Hit (Redis In-Memory) | Improvement |
 | :--- | :--- | :--- | :--- |
-| **p50 Latency** | $1,280\text{ ms}$ | **$2.8\text{ ms}$** | **$457\times$ faster** |
-| **p95 Latency** | $1,650\text{ ms}$ | **$8.4\text{ ms}$** | **$196\times$ faster** |
-| **p99 Latency** | $2,100\text{ ms}$ | **$14.2\text{ ms}$** | **$147\times$ faster** |
-| **Max Throughput** | $\sim 40\text{ QPS}$ *(LLM rate-limited)* | **$\sim 3,800\text{ QPS}$** | **$95\times$ scale** |
-| **API Cost** | $\$0.0004$ / query | **$\$0.0000$** | **100% cost elimination** |
+| **p50 Latency** | 1,280 ms | **2.8 ms** | **457x faster** |
+| **p95 Latency** | 1,650 ms | **8.4 ms** | **196x faster** |
+| **p99 Latency** | 2,100 ms | **14.2 ms** | **147x faster** |
+| **Max Throughput** | ~40 QPS *(LLM rate-limited)* | **~3,800 QPS** | **95x scale** |
+| **API Cost** | $0.0004 / query | **$0.0000** | **100% cost elimination** |
 
 ---
 
@@ -134,14 +136,19 @@ Starts PostgreSQL 16 (`pgvector:pg16` on `:5432`) and Redis 7 (`redis:7-alpine` 
 ```bash
 uv run pytest -v
 ```
-Runs all 27 unit, integration, and end-to-end tests in $< 2\text{ seconds}$ using offline deterministic embedding vectors.
+Runs all 27 unit, integration, and end-to-end tests in < 2 seconds using offline deterministic embedding vectors.
 
 ### 4. Run the API Server
 ```bash
 uv run uvicorn app.main:app --port 8000 --reload
 ```
 
-### 5. Run the k6 Load Benchmark
+### 5. Run the Background Worker
+```bash
+uv run arq app.worker.WorkerSettings
+```
+
+### 6. Run the k6 Load Benchmark
 ```bash
 k6 run benchmarks/k6_query_benchmark.js
 ```
