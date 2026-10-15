@@ -35,7 +35,7 @@ class QueryCache:
         query: str,
         answer: str,
         citations,
-        ttl_seconds: int | None,
+        ttl_seconds: int | None = None,
         document_id: UUID | None = None,
     ):
         key = self._make_key(query, document_id)

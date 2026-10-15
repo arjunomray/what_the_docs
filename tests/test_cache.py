@@ -8,11 +8,6 @@ from redis.asyncio import Redis
 from app.cache import CachedQueryResponse, QueryCache
 
 
-@pytest.fixture
-def query_cache(redis_client: Redis) -> QueryCache:
-    """Provide a QueryCache instance backed by the test Redis client."""
-    return QueryCache(redis=redis_client, default_ttl_seconds=60)
-
 
 async def test_cache_miss_returns_none(query_cache: QueryCache) -> None:
     """Querying an empty cache should return None."""

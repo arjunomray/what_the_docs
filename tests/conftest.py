@@ -5,6 +5,7 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.cache import QueryCache
 from app.config import DATABASE_URL, REDIS_URL
 from app.llm import DeterministicFakeProvider
 from app.models import init_db
@@ -58,3 +59,9 @@ async def redis_client() -> AsyncGenerator[Redis, None]:
 def fake_llm() -> DeterministicFakeProvider:
     """Provide an offline DeterministicFakeProvider instance."""
     return DeterministicFakeProvider()
+
+
+@pytest_asyncio.fixture
+def query_cache(redis_client: Redis) -> QueryCache:
+    """Provide a QueryCache instance backed by the test Redis client."""
+    return QueryCache(redis=redis_client, default_ttl_seconds=60)
